@@ -56,6 +56,9 @@ class DiscordForwarder:
         
     async def init_session(self):
         """Инициализация Discord сессии"""
+        if self.session:
+            await self.session.close()
+            self.session = None
         headers = {
             'Authorization': config.DISCORD_TOKEN,
             'User-Agent': self.ua.random,
@@ -233,16 +236,12 @@ class DiscordForwarder:
         if not content or len(content) > 4000:
             return
         
-        # Название темы/канала
-        prefix = self.get_channel_prefix(channel_id)
-        if not prefix:
-            return
-        
+        prefix = self.get_channel_prefix(channel_id) or f"{channel_id}: "
         author = message['author']['global_name'] or message['author']['username']
         timestamp = message['timestamp'][:19].replace('T', ' ')
         
-        tg_message = f"**{prefix}{content}**\n\n👤 *{author}*\n📅 `{timestamp}`"
-        
+        tg_message = f"{prefix}{content}\n\n👤 {author}\n📅 {timestamp}"
+        logger.info(f"📤 Пересылка: {channel_id} -> TG")
         await send_to_telegram(tg_message)
     
     def get_channel_prefix(self, channel_id: str) -> str:
@@ -257,15 +256,16 @@ forwarder = DiscordForwarder()
 
 async def send_to_telegram(message: str):
     if config.TARGET_TG_CHAT_ID == 0:
+        logger.warning("TARGET_TG_CHAT_ID не задан — /target <chat_id>")
         return
     try:
         bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
         await bot.send_message(
             chat_id=config.TARGET_TG_CHAT_ID,
             text=message,
-            parse_mode='Markdown',
             disable_web_page_preview=True
         )
+        logger.info(f"✅ Отправлено в TG {config.TARGET_TG_CHAT_ID}")
     except Exception as e:
         logger.error(f"TG отправка ошибка: {e}")
 
