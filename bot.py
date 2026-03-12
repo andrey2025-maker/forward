@@ -320,13 +320,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 def _split_message(text: str, max_len: int = 4000) -> list:
-    """Разбить сообщение для лимита Telegram (4096)"""
+    """Разбить сообщение для лимита Telegram (4096). Режет по строкам, не ломая эмодзи."""
     if len(text) <= max_len:
         return [text]
     parts = []
     while text:
-        parts.append(text[:max_len])
-        text = text[max_len:]
+        chunk = text[:max_len]
+        last_nl = chunk.rfind('\n')
+        if last_nl > max_len // 2:
+            chunk, text = chunk[:last_nl + 1], text[last_nl + 1:]
+        else:
+            text = text[max_len:]
+        parts.append(chunk)
     return parts
 
 async def channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -347,17 +352,17 @@ async def channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ Ошибка: {e}")
             return
     
-    text = "📋 *Каналы и темы Discord:*\n\n"
+    text = "📋 Каналы и темы Discord:\n\n"
     for guild_id, guild in forwarder.guilds.items():
-        text += f"🏛️ *{guild['name']}*\n"
+        text += f"🏛️ {guild['name']}\n"
         if guild_id in forwarder.channels:
             for ch in forwarder.channels[guild_id]:
                 status = "✅" if ch['id'] in forwarder.active_channels else "⭕"
-                text += f"  {status} `{ch['id']}` {ch['name']}\n"
+                text += f"  {status} {ch['id']} — {ch['name']}\n"
         text += "\n"
     
     for part in _split_message(text):
-        await update.message.reply_text(part, parse_mode='Markdown')
+        await update.message.reply_text(part)
 
 async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != config.ADMIN_TG_ID or not context.args:
@@ -381,17 +386,17 @@ async def list_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not forwarder.active_channels:
         await update.message.reply_text("📭 Нет активных каналов")
         return
-    text = "✅ *Активные каналы:*\n\n"
+    text = "✅ Активные каналы:\n\n"
     for cid in forwarder.active_channels:
         found = False
         for gid, channels in forwarder.channels.items():
             for ch in channels:
                 if ch['id'] == cid:
-                    text += f"`{cid}` - {ch['name']} ({forwarder.guilds[gid]['name']})\n"
+                    text += f"{cid} — {ch['name']} ({forwarder.guilds[gid]['name']})\n"
                     found = True
                     break
             if found: break
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await update.message.reply_text(text)
 
 async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != config.ADMIN_TG_ID or not context.args:
