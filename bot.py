@@ -187,7 +187,7 @@ class DiscordForwarder:
             'op': 2,
             'd': {
                 'token': config.DISCORD_TOKEN,
-                'intents': 513,  # Guilds + Guild Messages
+                'intents': 33281,  # Guilds + Guild Messages + MESSAGE_CONTENT (для content)
                 'properties': {
                     'os': 'Windows',
                     'browser': 'Chrome',
@@ -225,15 +225,19 @@ class DiscordForwarder:
             self.heartbeat_interval = data['d']['heartbeat_interval']
         
         elif data['op'] == 0 and data['t'] == 'MESSAGE_CREATE':
+            ch_id = str(data['d'].get('channel_id', ''))
+            if ch_id in self.active_channels:
+                logger.info(f"📨 MESSAGE_CREATE из {ch_id}")
             await self.handle_message_create(data['d'])
     
     async def handle_message_create(self, message):
-        channel_id = message['channel_id']
+        channel_id = str(message.get('channel_id', ''))
         if channel_id not in self.active_channels:
             return
         
         content = message.get('content', '').strip()
         if not content or len(content) > 4000:
+            logger.info(f"⚠️ Сообщение из {channel_id} без текста — пропуск (только вложения?)")
             return
         
         prefix = self.get_channel_prefix(channel_id) or f"{channel_id}: "
