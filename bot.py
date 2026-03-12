@@ -88,7 +88,7 @@ class DiscordForwarder:
                     logger.error(f"Discord @me: {resp.status} {data}")
                     raise RuntimeError(f"Discord API: {data.get('message', 'Invalid token?')}")
                 self.discord_user_id = data['id']
-                logger.info(f"✅ Discord подключен: {data.get('username', '?')}#{data.get('discriminator', '0')}")
+                logger.info(f"✅ Discord подключен: {data.get('username', '?')}")
             
             await self.load_guilds_and_channels()
             
@@ -182,18 +182,20 @@ class DiscordForwarder:
             ping_interval=None
         )
         
-        # Identify
+        # Identify (User Token)
         identify = {
             'op': 2,
             'd': {
                 'token': config.DISCORD_TOKEN,
-                'intents': 33281,  # Guilds + Guild Messages + MESSAGE_CONTENT (для content)
+                'intents': 33281,  # Guilds + Guild Messages + MESSAGE_CONTENT
+                'capabilities': 16381,  # как у нативного клиента Discord
                 'properties': {
                     'os': 'Windows',
                     'browser': 'Chrome',
                     'device': '',
-                    'system_locale': 'en-US'
-                }
+                    'system_locale': 'ru-RU'
+                },
+                'presence': {'status': 'invisible', 'since': 0, 'activities': [], 'afk': False}
             }
         }
         await self.ws.send(json.dumps(identify))
