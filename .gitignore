@@ -1,0 +1,19 @@
+# Секреты
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+*.egg-info/
+.eggs/
+
+# Конфиги бота (содержат ID каналов)
+bot_config.json
+channels_config.json
+
+# Логи
+*.log
