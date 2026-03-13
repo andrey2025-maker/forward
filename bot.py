@@ -12,7 +12,7 @@ from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
-load_dotenv()  # опционально, если есть .env
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,7 +47,6 @@ class DiscordGatewayClient:
         self.token = token
         self.tg_bot = tg_bot
         self.ws = None
-        self._session = None
         self.heartbeat_interval = None
         self.sequence = None
         self.session_id = None
@@ -60,16 +59,13 @@ class DiscordGatewayClient:
     def load_channels(self):
         try:
             with open('channels_config.json', 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return set(data.get('active_channels', data.get('channels', [])))
-                return set(data)
-        except (FileNotFoundError, json.JSONDecodeError):
+                return set(json.load(f))
+        except:
             return set()
 
     def save_channels(self):
         with open('channels_config.json', 'w', encoding='utf-8') as f:
-            json.dump({'active_channels': list(self.channels)}, f, indent=2)
+            json.dump(list(self.channels), f, indent=2)
 
     def get_fresh_headers(self):
         fp = random.choice(BROWSER_FINGERPRINTS)
@@ -103,18 +99,18 @@ class DiscordGatewayClient:
                 await asyncio.sleep(wait_time)
 
     async def _connect_once(self):
-        if self._session:
-            await self._session.close()
-            self._session = None
-        self._session = aiohttp.ClientSession(headers=self.get_fresh_headers())
-        async with self._session.get('https://discord.com/api/v10/gateway') as resp:
-            data = await resp.json()
-            gateway_url = data['url'] + "/?v=10&encoding=json"
-        self.ws = await self._session.ws_connect(gateway_url)
-        await self.identify()
-        self.running = True
-        asyncio.create_task(self.heartbeat_loop())
-        asyncio.create_task(self.message_loop())
+        async with aiohttp.ClientSession() as session:
+            async with session.get('https://discord.com/api/v10/gateway', 
+                                 headers=self.get_fresh_headers()) as resp:
+                data = await resp.json()
+                gateway_url = data['url'] + f"/?v=10&encoding=json&compress=zlib-stream"
+
+            self.ws = await aiohttp.ClientSession().ws_connect(gateway_url)
+            await self.identify()
+            
+            self.running = True
+            asyncio.create_task(self.heartbeat_loop())
+            asyncio.create_task(self.message_loop())
 
     async def identify(self):
         build_num = self.current_fp['client_build']
@@ -122,7 +118,6 @@ class DiscordGatewayClient:
             "op": 2,
             "d": {
                 "token": self.token,
-                "intents": 33281,  # Guilds + Guild Messages + MESSAGE_CONTENT
                 "capabilities": 1771412421886079,
                 "properties": {
                     "os": "Windows",
@@ -147,22 +142,14 @@ class DiscordGatewayClient:
         await self.ws.send_json(payload)
 
     async def heartbeat_loop(self):
-        while self.running and self.heartbeat_interval is None:
-            await asyncio.sleep(0.1)
-        if not self.running:
-            return
-        interval_sec = self.heartbeat_interval / 1000
         while self.running:
-            try:
-                now = time.time()
-                if now - self.last_heartbeat > interval_sec * 0.8:
-                    await self.ws.send_json({"op": 1, "d": self.sequence})
-                    self.last_heartbeat = now
-                await asyncio.sleep(interval_sec * random.uniform(0.8, 1.2))
-            except Exception as e:
-                if self.running:
-                    logger.debug(f"heartbeat: {e}")
-                break
+            now = time.time()
+            if now - self.last_heartbeat > self.heartbeat_interval / 1000 * 0.8:
+                await self.ws.send_json({"op": 1, "d": self.sequence})
+                self.last_heartbeat = now
+            
+            jitter = random.uniform(0.8, 1.2)
+            await asyncio.sleep(self.heartbeat_interval / 1000 * jitter)
 
     async def message_loop(self):
         async for msg in self.ws:
@@ -175,22 +162,14 @@ class DiscordGatewayClient:
 
     async def reconnect(self):
         self.running = False
-        if self.ws:
-            await self.ws.close()
-        if self._session:
-            await self._session.close()
-            self._session = None
         await asyncio.sleep(random.uniform(1, 3))
         await self.connect()
 
     async def handle_event(self, data):
         self.sequence = data.get('s')
         
-        if data.get('op') == 10:  # Hello — первое сообщение, содержит heartbeat_interval
+        if data.get('t') == 'READY':
             self.heartbeat_interval = data['d']['heartbeat_interval']
-        
-        elif data.get('t') == 'READY':
-            self.heartbeat_interval = data['d'].get('heartbeat_interval') or self.heartbeat_interval
             self.session_id = data['d']['session_id']
             logger.info(f"✅ Готов: {data['d']['user']['username']} (build {self.current_fp['client_build']})")
         
@@ -198,8 +177,8 @@ class DiscordGatewayClient:
             await self.handle_message(data['d'])
 
     def escape_md2(self, text):
-        chars = '_*[]()~`>#+-=|{}.!'
-        return ''.join('\\' + c if c in chars else c for c in str(text)[:4000])
+        chars = r'_*[]()~`>#+-=|{}.!\\/'
+        return re.sub(re.escape(chars), r'\\\g<0>', str(text)[:4000])
 
     async def handle_message(self, msg):
         channel_id = str(msg['channel_id'])
@@ -229,13 +208,9 @@ class DiscordGatewayClient:
         
         if is_thread:
             thread_name = channel.get('name', 'Тема')
-            text = f"{self.escape_md2(thread_name)}: \\[{self.escape_md2(timestamp)}\\] {self.escape_md2(author)}: {self.escape_md2(content)}"
+            text = f"{self.escape_md2(thread_name)}: \\[{timestamp}\\] {self.escape_md2(author)}: {self.escape_md2(content)}"
         else:
-            text = f"\\[{self.escape_md2(timestamp)}\\] {self.escape_md2(author)}: {self.escape_md2(content)}"
-
-        if not self.tg_bot.target_chat_id:
-            logger.warning("target_chat_id не задан — /target <chat_id>")
-            return
+            text = f"\\[{timestamp}\\] {self.escape_md2(author)}: {self.escape_md2(content)}"
 
         for attempt in range(3):
             try:
@@ -246,27 +221,14 @@ class DiscordGatewayClient:
                 logger.error(f"TG retry {attempt+1}: {e}")
                 await asyncio.sleep(0.5 ** attempt)
 
-CONFIG_FILE = 'bot_config.json'
-
 class TelegramBot:
     def __init__(self, token, admin_id):
         self.token = token
         self.admin_id = int(admin_id)
-        self.target_chat_id = self._load_target()
+        self.target_chat_id = None
         self.discord = None
         self.app = None
         self.bot = Bot(token=token)
-
-    def _load_target(self):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f).get('target_chat_id')
-        except (FileNotFoundError, json.JSONDecodeError):
-            return None
-
-    def _save_target(self):
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump({'target_chat_id': self.target_chat_id}, f, indent=2)
 
     async def send_message(self, chat_id, text, parse_mode=ParseMode.MARKDOWN_V2):
         try:
@@ -351,7 +313,6 @@ class TelegramBot:
             return await update.message.reply_text("❌ `/target -1001234567890`")
         
         self.target_chat_id = context.args[0]
-        self._save_target()
         await update.message.reply_text(f"✅ TG чат: `{self.target_chat_id}`")
 
     async def cmd_status(self, update: Update, context):
@@ -365,16 +326,11 @@ TG цель: {self.target_chat_id or "не установлена"}
 
 async def main():
     DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
-    ADMIN_ID = os.getenv('ADMIN_ID') or os.getenv('ADMIN_TG_ID')
+    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+    ADMIN_ID = os.getenv('ADMIN_ID')
 
-    missing = []
-    if not DISCORD_TOKEN: missing.append('DISCORD_TOKEN')
-    if not TELEGRAM_TOKEN: missing.append('TELEGRAM_TOKEN или TELEGRAM_BOT_TOKEN')
-    if not ADMIN_ID: missing.append('ADMIN_ID или ADMIN_TG_ID')
-
-    if missing:
-        logger.error(f"❌ Не заданы переменные окружения: {', '.join(missing)}")
+    if not all([DISCORD_TOKEN, TELEGRAM_TOKEN, ADMIN_ID]):
+        logger.error("❌ Заполни .env!")
         return
 
     tg_bot = TelegramBot(TELEGRAM_TOKEN, ADMIN_ID)
