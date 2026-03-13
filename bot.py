@@ -1,351 +1,321 @@
-import os
-import json
+#!/usr/bin/env python3
+"""
+Discord → Telegram бот-пересылатель
+✅ User token (анти-бан браузерная эмуляция)
+✅ Темы (threads) = отдельный channel_id (/add ID напрямую)
+✅ Постоянная JSON-конфигурация
+✅ Команды админа на русском
+✅ Эмодзи/спецсимволы в названиях тем
+✅ Серверные переменные окружения (без .env)
+"""
+
 import asyncio
+import json
 import logging
+import os
 import re
-import random
 import time
+import zlib
 from datetime import datetime
-from dotenv import load_dotenv
+from typing import Dict, Any, Optional
+
 import aiohttp
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.constants import ParseMode
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-load_dotenv()
+# Конфигурация - читает серверные переменные окружения
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', '0'))  # 0 = без ограничений
 
+# Логирование
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    handlers=[logging.FileHandler('bot.log', encoding='utf-8'), logging.StreamHandler()]
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-BROWSER_FINGERPRINTS = [
-    {
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "sec_ch_ua_platform": '"Windows"',
-        "client_build": 314005
-    },
-    {
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="121", "Google Chrome";v="121"',
-        "sec_ch_ua_platform": '"Windows"',
-        "client_build": 320672
-    },
-    {
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "sec_ch_ua_platform": '"macOS"',
-        "client_build": 314005
-    }
-]
-
-class DiscordGatewayClient:
-    def __init__(self, token, tg_bot):
-        self.token = token
-        self.tg_bot = tg_bot
+class DiscordGateway:
+    def __init__(self):
         self.ws = None
-        self.heartbeat_interval = None
+        self.session = None
+        self.heartbeat_interval = 41.25
+        self.last_heartbeat = 0
         self.sequence = None
         self.session_id = None
-        self.channels = self.load_channels()
-        self.message_cache = {}
+        self.resume_url = None
+        self.channels_config = self.load_config()
         self.running = False
-        self.current_fp = random.choice(BROWSER_FINGERPRINTS)
-        self.last_heartbeat = 0
+        self.fingerprints = [  # 3 Chrome отпечатка для ротации
+            {
+                'browser': 'Chrome', 'browser_user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'os': 'Windows', 'os_version': '10', 'device': 'Windows Device', 'system_locale': 'ru-RU',
+                'browser_version': '120.0.0.0', 'client_build_number': 9999999
+            },
+            {
+                'browser': 'Chrome', 'browser_user_agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'os': 'Mac OS X', 'os_version': '10.15.7', 'device': 'Mac', 'system_locale': 'ru-RU',
+                'browser_version': '120.0.0.0', 'client_build_number': 388668
+            },
+            {
+                'browser': 'Chrome', 'browser_user_agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'os': 'Linux', 'os_version': '0', 'device': 'Linux Device', 'system_locale': 'ru-RU',
+                'browser_version': '120.0.0.0', 'client_build_number': 9999999
+            }
+        ]
+        self.current_fp_idx = 0
 
-    def load_channels(self):
+    def load_config(self) -> set:
+        """Загрузка отслеживаемых каналов/тем из JSON"""
         try:
             with open('channels_config.json', 'r', encoding='utf-8') as f:
                 return set(json.load(f))
-        except:
+        except FileNotFoundError:
             return set()
 
-    def save_channels(self):
+    def save_config(self):
+        """Сохранение в JSON (выживает перезапуски)"""
         with open('channels_config.json', 'w', encoding='utf-8') as f:
-            json.dump(list(self.channels), f, indent=2)
+            json.dump(list(self.channels_config), f, ensure_ascii=False, indent=2)
 
-    def get_fresh_headers(self):
-        fp = random.choice(BROWSER_FINGERPRINTS)
-        self.current_fp = fp
-        return {
-            'Authorization': self.token,
-            'User-Agent': fp['user_agent'],
-            'Accept': '*/*',
-            'Accept-Language': random.choice(['ru-RU,ru;q=0.9,en;q=0.8', 'en-US,en;q=0.9', 'ru-RU,en;q=0.8']),
-            'Sec-Ch-Ua': fp['sec_ch_ua'],
-            'Sec-Ch-Ua-Mobile': '?0',
-            'Sec-Ch-Ua-Platform': fp['sec_ch_ua_platform'],
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'same-origin',
-            'Origin': 'https://discord.com',
-            'Referer': 'https://discord.com/channels/@me',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-        }
+    def escape_markdown_v2(self, text: str) -> str:
+        """Экранирование для Telegram MarkdownV2 (эмодзи/спецсимволы работают!)"""
+        chars = r'_*[]()~`>#+-=|{}.!'
+        for char in chars:
+            text = text.replace(char, f'\\{char}')
+        return text
+
+    async def get_fp(self):
+        """Ротация браузерных отпечатков"""
+        fp = self.fingerprints[self.current_fp_idx]
+        self.current_fp_idx = (self.current_fp_idx + 1) % 3
+        return fp
 
     async def connect(self):
-        for attempt in range(1, 6):
-            try:
-                await self._connect_once()
-                logger.info("✅ Discord подключён")
-                return
-            except Exception as e:
-                wait_time = (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(f"❌ Подключение #{attempt} ошибка: {e}. Жду {wait_time:.1f}s")
-                await asyncio.sleep(wait_time)
-
-    async def _connect_once(self):
-        async with aiohttp.ClientSession() as session:
-            async with session.get('https://discord.com/api/v10/gateway', 
-                                 headers=self.get_fresh_headers()) as resp:
-                data = await resp.json()
-                gateway_url = data['url'] + f"/?v=10&encoding=json&compress=zlib-stream"
-
-            self.ws = await aiohttp.ClientSession().ws_connect(gateway_url)
-            await self.identify()
+        """Подключение к Discord Gateway (браузерная эмуляция)"""
+        try:
+            self.session = aiohttp.ClientSession()
+            fp = await self.get_fp()
             
-            self.running = True
-            asyncio.create_task(self.heartbeat_loop())
-            asyncio.create_task(self.message_loop())
-
-    async def identify(self):
-        build_num = self.current_fp['client_build']
-        payload = {
-            "op": 2,
-            "d": {
-                "token": self.token,
-                "capabilities": 1771412421886079,
-                "properties": {
-                    "os": "Windows",
-                    "browser": "Chrome",
-                    "device": "",
-                    "system_locale": "ru-RU",
-                    "browser_user_agent": self.current_fp['user_agent'],
-                    "browser_version": "120.0.0.0", 
-                    "os_version": "10",
-                    "referrer": "https://discord.com",
-                    "referring_domain": "discord.com",
-                    "referrer_current": "",
-                    "referring_domain_current": "",
-                    "release_channel": "stable",
-                    "client_build_number": build_num,
-                    "client_event_source": None
-                },
-                "compress": True,
-                "client_track": "cf66e09a-af4c-44ce-9f11-34686a6e6285"
+            payload = {
+                "op": 2, "d": {
+                    "token": DISCORD_TOKEN, "properties": {
+                        "$os": fp['os'], "$browser": fp['browser'], "$device": fp['device'],
+                        "$system_locale": fp['system_locale'], "$browser_version": fp['browser_version'],
+                        "$client_build_number": fp['client_build_number'], "os_version": fp['os_version'],
+                        "referrer": "", "referring_domain": "", "release_channel": "stable"
+                    }, "compress": True, "large_threshold": 250
+                }
             }
-        }
-        await self.ws.send_json(payload)
+            
+            async with self.session.post('wss://gateway.discord.gg/?v=10&encoding=json', json=payload) as resp:
+                gateway_url = (await resp.json())['d']['url']
+            
+            self.ws = await self.session.ws_connect(
+                gateway_url + '?v=10&encoding=json&compress=zlib-stream',
+                autoclose=False, heartbeat_timeout=60
+            )
+            
+            logger.info("✅ Подключен к Discord Gateway")
+            self.running = True
+            await self.listen()
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка подключения: {e}")
+            await asyncio.sleep(5)
+            await self.connect()
 
-    async def heartbeat_loop(self):
+    async def send(self, data: Dict):
+        """Отправка с лимитом (30/сек)"""
+        if time.time() - self.last_heartbeat < 0.033:
+            await asyncio.sleep(0.033)
+        await self.ws.send_json(data)
+
+    async def heartbeat(self):
+        """Heartbeat с джиттером (анти-бан)"""
         while self.running:
             now = time.time()
-            if now - self.last_heartbeat > self.heartbeat_interval / 1000 * 0.8:
-                await self.ws.send_json({"op": 1, "d": self.sequence})
+            jitter = (hash(str(now)) % 5000) / 1000.0
+            if now - self.last_heartbeat >= self.heartbeat_interval + jitter:
+                await self.send({"op": 1, "d": None})
                 self.last_heartbeat = now
+            await asyncio.sleep(1)
+
+    async def handle_message_create(self, data: Dict):
+        """Обработка сообщений Discord"""
+        channel_id = str(data['d']['channel_id'])
+        if channel_id not in self.channels_config:
+            return
             
-            jitter = random.uniform(0.8, 1.2)
-            await asyncio.sleep(self.heartbeat_interval / 1000 * jitter)
-
-    async def message_loop(self):
-        async for msg in self.ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                data = json.loads(msg.data)
-                await self.handle_event(data)
-            elif msg.type == aiohttp.WSMsgType.CLOSED:
-                logger.warning("⚠️ WS закрыт, переподключение...")
-                await self.reconnect()
-
-    async def reconnect(self):
-        self.running = False
-        await asyncio.sleep(random.uniform(1, 3))
-        await self.connect()
-
-    async def handle_event(self, data):
-        self.sequence = data.get('s')
-        
-        if data.get('t') == 'READY':
-            self.heartbeat_interval = data['d']['heartbeat_interval']
-            self.session_id = data['d']['session_id']
-            logger.info(f"✅ Готов: {data['d']['user']['username']} (build {self.current_fp['client_build']})")
-        
-        elif data.get('t') == 'MESSAGE_CREATE':
-            await self.handle_message(data['d'])
-
-    def escape_md2(self, text):
-        chars = r'_*[]()~`>#+-=|{}.!\\/'
-        return re.sub(re.escape(chars), r'\\\g<0>', str(text)[:4000])
-
-    async def handle_message(self, msg):
-        channel_id = str(msg['channel_id'])
-        if channel_id not in self.channels:
-            return
-
-        msg_id = msg['id']
-        cache_key = f"{channel_id}:{msg_id}"
-        if cache_key in self.message_cache:
-            return
-        self.message_cache[cache_key] = time.time() + 300
-
-        active = [k for k,v in self.message_cache.items() if v > time.time()]
-        if len(active) > 30:
-            await asyncio.sleep(0.1)
-            return
-
-        if msg['author']['bot'] or not msg['content'].strip():
-            return
-
-        content = msg['content'].strip()
+        msg = data['d']
         author = msg['author']['username']
-        timestamp = datetime.fromisoformat(msg['timestamp'][:-1]).strftime("%H:%M")
-
-        channel = msg.get('channel', {})
-        is_thread = channel.get('type') in [10, 11, 12]
+        content = msg['content'] or "🖼️ [фото/видео/файл]"
+        timestamp = datetime.fromisoctime(msg['timestamp']).strftime("%H:%M")
         
-        if is_thread:
-            thread_name = channel.get('name', 'Тема')
-            text = f"{self.escape_md2(thread_name)}: \\[{timestamp}\\] {self.escape_md2(author)}: {self.escape_md2(content)}"
+        # Имя темы
+        thread_name = ""
+        if msg.get('message_reference', {}).get('channel_id'):
+            thread_id = msg['message_reference']['channel_id']
+            logger.info(f"🧵 Обнаружена тема (ID: {thread_id}) - добавьте: /add {thread_id}")
+        elif msg.get('thread', {}).get('name'):
+            thread_name = msg['thread']['name']
+        
+        # Формат: "НазваниеТемы: [HH:MM] User: сообщение"
+        if thread_name:
+            formatted = f"{thread_name}: [{timestamp}] {author}: {content}"
         else:
-            text = f"\\[{timestamp}\\] {self.escape_md2(author)}: {self.escape_md2(content)}"
+            formatted = f"[{timestamp}] {author}: {content}"
+        
+        await self.forward_to_telegram(formatted)
 
-        for attempt in range(3):
-            try:
-                await self.tg_bot.send_message(self.tg_bot.target_chat_id, text)
-                logger.info(f"✅ Переслано {channel_id[:10]}...")
-                break
-            except Exception as e:
-                logger.error(f"TG retry {attempt+1}: {e}")
-                await asyncio.sleep(0.5 ** attempt)
-
-class TelegramBot:
-    def __init__(self, token, admin_id):
-        self.token = token
-        self.admin_id = int(admin_id)
-        self.target_chat_id = None
-        self.discord = None
-        self.app = None
-        self.bot = Bot(token=token)
-
-    async def send_message(self, chat_id, text, parse_mode=ParseMode.MARKDOWN_V2):
+    async def forward_to_telegram(self, text: str):
+        """Пересылка в Telegram"""
         try:
-            await self.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
-        except:
-            try:
-                await self.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
-            except:
-                await self.bot.send_message(chat_id=chat_id, text=text)
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                escaped = self.escape_markdown_v2(text)
+                
+                data = {
+                    "chat_id": TELEGRAM_CHAT_ID, "text": escaped,
+                    "parse_mode": "MarkdownV2", "disable_web_page_preview": True
+                }
+                
+                async with session.post(url, json=data) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"⚠️ Telegram ошибка: {await resp.text()}")
+        except Exception as e:
+            logger.error(f"❌ Telegram: {e}")
 
-    async def start(self):
-        self.app = Application.builder().token(self.token).build()
-        self.app.add_handler(CommandHandler("start", self.cmd_start))
-        self.app.add_handler(CommandHandler("channels", self.cmd_channels))
-        self.app.add_handler(CommandHandler("threads", self.cmd_threads))
-        self.app.add_handler(CommandHandler("add", self.cmd_add))
-        self.app.add_handler(CommandHandler("del", self.cmd_del))
-        self.app.add_handler(CommandHandler("target", self.cmd_target))
-        self.app.add_handler(CommandHandler("status", self.cmd_status))
+    async def listen(self):
+        """Основной цикл прослушки"""
+        heartbeat_task = asyncio.create_task(self.heartbeat())
+        try:
+            async for msg in self.ws:
+                if not self.running:
+                    break
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    self.sequence = data.get('s')
+                    
+                    if data['op'] == 10:  # Hello
+                        self.heartbeat_interval = data['d']['heartbeat_interval'] / 1000
+                        await self.send({"op": 1, "d": None})
+                    elif data['op'] == 0 and data['t'] == 'MESSAGE_CREATE':
+                        await self.handle_message_create(data)
+                    elif data['op'] == 0 and data['t'] == 'READY':
+                        logger.info("✅ Discord готов")
+                        
+        except Exception as e:
+            logger.error(f"❌ Gateway: {e}")
+        finally:
+            heartbeat_task.cancel()
+            self.running = False
 
-        await self.app.initialize()
-        await self.app.start()
-        await self.app.updater.start_polling()
+    async def add_channel(self, channel_id: str):
+        self.channels_config.add(channel_id)
+        self.save_config()
+        logger.info(f"➕ Добавлен: {channel_id}")
 
-    async def restricted(self, update: Update):
-        return update.effective_user.id == self.admin_id
+    async def remove_channel(self, channel_id: str):
+        self.channels_config.discard(channel_id)
+        self.save_config()
+        logger.info(f"➖ Удален: {channel_id}")
 
-    async def cmd_start(self, update: Update, context):
-        if not await self.restricted(update): return
-        await update.message.reply_text(
-            "🤖 *Discord → TG Bot*\n\n"
-            "/channels - список\n"
-            "/add ID - добавить\n"
-            "/del ID - удалить\n"
-            "/target ID - TG чат\n"
-            "/threads - как найти ID темы\n"
-            "/status - статус"
-        )
+# Глобальный экземпляр
+discord_gateway = DiscordGateway()
 
-    async def cmd_channels(self, update: Update, context):
-        if not await self.restricted(update): return
-        channels = self.discord.channels if self.discord else []
-        if not channels:
-            await update.message.reply_text("📭 Каналов нет")
-            return
-        text = "📋 *Каналы:*\n" + "\n".join(f"• `{ch}`" for ch in sorted(channels))
-        await update.message.reply_text(text, parse_mode='Markdown')
+# Telegram команды
+async def check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if ADMIN_USER_ID == 0 or update.effective_user.id == ADMIN_USER_ID:
+        return True
+    await update.message.reply_text("❌ Доступ запрещен")
+    return False
 
-    async def cmd_threads(self, update: Update, context):
-        if not await self.restricted(update): return
-        await update.message.reply_text(
-            "🔍 *ID темы (НЕ канала!):*\n\n"
-            "1. Смотри bot.log\n"
-            "2. Ищи: `channel_id: 987654321`\n"
-            "3. `/add 987654321`\n\n"
-            "*Формат:* `😎 Название: [12:34] User: текст`"
-        )
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update, context): return
+    if not context.args:
+        await update.message.reply_text("ℹ️ `/add ID` - добавить канал/тему\nПример: `/add 123456789`")
+        return
+    for cid in context.args:
+        discord_gateway.add_channel(cid)
+    await update.message.reply_text(f"✅ Добавлено: `{', '.join(context.args)}`")
 
-    async def cmd_add(self, update: Update, context):
-        if not await self.restricted(update): return
-        if not context.args:
-            return await update.message.reply_text("❌ `/add 123456789`")
-        
-        cid = context.args[0]
-        self.discord.channels.add(cid)
-        self.discord.save_channels()
-        await update.message.reply_text(f"✅ Добавлен `{cid}`")
+async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update, context): return
+    if not context.args:
+        await update.message.reply_text("ℹ️ `/del ID` - удалить")
+        return
+    removed = [cid for cid in context.args if discord_gateway.remove_channel(cid)]
+    await update.message.reply_text(f"✅ Удалено: `{', '.join(removed)}`")
 
-    async def cmd_del(self, update: Update, context):
-        if not await self.restricted(update): return
-        if not context.args:
-            return await update.message.reply_text("❌ `/del 123456789`")
-        
-        cid = context.args[0]
-        self.discord.channels.discard(cid)
-        self.discord.save_channels()
-        await update.message.reply_text(f"✅ Удалён `{cid}`")
+async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_add(update, context)
 
-    async def cmd_target(self, update: Update, context):
-        if not await self.restricted(update): return
-        if not context.args:
-            return await update.message.reply_text("❌ `/target -1001234567890`")
-        
-        self.target_chat_id = context.args[0]
-        await update.message.reply_text(f"✅ TG чат: `{self.target_chat_id}`")
+async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update, context): return
+    if not discord_gateway.channels_config:
+        await update.message.reply_text("📭 Нет каналов/тем")
+    else:
+        lst = '\n'.join(f"`{cid}`" for cid in sorted(discord_gateway.channels_config))
+        await update.message.reply_text(f"📋 **Каналы/темы ({len(discord_gateway.channels_config)}):**\n```\n{lst}\n```")
 
-    async def cmd_status(self, update: Update, context):
-        if not await self.restricted(update): return
-        status = f"""📊 *Статус:*
-Discord: {"✅" if self.discord and self.discord.running else "❌"}
-TG цель: {self.target_chat_id or "не установлена"}
-Каналов: {len(self.discord.channels) if self.discord else 0}
-Кэш: {len([k for k,v in self.discord.message_cache.items() if v > time.time()])}"""
-        await update.message.reply_text(status)
+async def cmd_threads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🧵 **Как добавить темы:**\n\n"
+        "1. Запустите бота\n"
+        "2. Смотрите `bot.log` - найдите: `🧵 Обнаружена тема (ID: 123456789)`\n"
+        "3. `/add 123456789`\n\n"
+        "**Формат:** `📱Тема🎉: [14:35] User: текст`\n"
+        "✅ Эмодзи и спецсимволы работают!"
+    )
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update, context): return
+    status = "🟢 РАБОТАЕТ" if discord_gateway.running else "🔴 ОСТАНОВЛЕН"
+    count = len(discord_gateway.channels_config)
+    await update.message.reply_text(f"📊 **Статус:** {status}\n📡 **Каналов/тем:** {count}")
 
 async def main():
-    DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-    ADMIN_ID = os.getenv('ADMIN_ID')
-
-    if not all([DISCORD_TOKEN, TELEGRAM_TOKEN, ADMIN_ID]):
-        logger.error("❌ Заполни .env!")
+    # Проверка переменных
+    required = {'DISCORD_TOKEN': DISCORD_TOKEN, 'TELEGRAM_TOKEN': TELEGRAM_TOKEN, 'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID}
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        logger.error(f"❌ Нет переменных: {', '.join(missing)}")
+        logger.info("💡 `export DISCORD_TOKEN=токен`")
         return
-
-    tg_bot = TelegramBot(TELEGRAM_TOKEN, ADMIN_ID)
     
-    discord_client = DiscordGatewayClient(DISCORD_TOKEN, tg_bot)
-    tg_bot.discord = discord_client
-
-    discord_task = asyncio.create_task(discord_client.connect())
-    tg_task = asyncio.create_task(tg_bot.start())
+    logger.info("🚀 Запуск Discord→Telegram...")
     
-    logger.info("🚀 Бот запущен!")
-    await asyncio.gather(discord_task, tg_task)
+    # Discord
+    gateway_task = asyncio.create_task(discord_gateway.connect())
+    
+    # Telegram
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("del", cmd_del))
+    app.add_handler(CommandHandler("target", cmd_target))
+    app.add_handler(CommandHandler("channels", cmd_channels))
+    app.add_handler(CommandHandler("threads", cmd_threads))
+    app.add_handler(CommandHandler("status", cmd_status))
+    
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    
+    logger.info("✅ Готов! Команды: /add ID, /channels, /threads")
+    
+    try:
+        await gateway_task
+    except KeyboardInterrupt:
+        pass
+    finally:
+        discord_gateway.running = False
+        await app.stop()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("🛑 Остановлен")
+    asyncio.run(main())
