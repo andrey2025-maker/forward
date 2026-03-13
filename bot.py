@@ -47,6 +47,7 @@ class DiscordGatewayClient:
         self.token = token
         self.tg_bot = tg_bot
         self.ws = None
+        self._session = None
         self.heartbeat_interval = None
         self.sequence = None
         self.session_id = None
@@ -102,18 +103,18 @@ class DiscordGatewayClient:
                 await asyncio.sleep(wait_time)
 
     async def _connect_once(self):
-        async with aiohttp.ClientSession() as session:
-            async with session.get('https://discord.com/api/v10/gateway', 
-                                 headers=self.get_fresh_headers()) as resp:
-                data = await resp.json()
-                gateway_url = data['url'] + "/?v=10&encoding=json"
-
-            self.ws = await aiohttp.ClientSession(headers=self.get_fresh_headers()).ws_connect(gateway_url)
-            await self.identify()
-            
-            self.running = True
-            asyncio.create_task(self.heartbeat_loop())
-            asyncio.create_task(self.message_loop())
+        if self._session:
+            await self._session.close()
+            self._session = None
+        self._session = aiohttp.ClientSession(headers=self.get_fresh_headers())
+        async with self._session.get('https://discord.com/api/v10/gateway') as resp:
+            data = await resp.json()
+            gateway_url = data['url'] + "/?v=10&encoding=json"
+        self.ws = await self._session.ws_connect(gateway_url)
+        await self.identify()
+        self.running = True
+        asyncio.create_task(self.heartbeat_loop())
+        asyncio.create_task(self.message_loop())
 
     async def identify(self):
         build_num = self.current_fp['client_build']
@@ -146,14 +147,22 @@ class DiscordGatewayClient:
         await self.ws.send_json(payload)
 
     async def heartbeat_loop(self):
+        while self.running and self.heartbeat_interval is None:
+            await asyncio.sleep(0.1)
+        if not self.running:
+            return
+        interval_sec = self.heartbeat_interval / 1000
         while self.running:
-            now = time.time()
-            if now - self.last_heartbeat > self.heartbeat_interval / 1000 * 0.8:
-                await self.ws.send_json({"op": 1, "d": self.sequence})
-                self.last_heartbeat = now
-            
-            jitter = random.uniform(0.8, 1.2)
-            await asyncio.sleep(self.heartbeat_interval / 1000 * jitter)
+            try:
+                now = time.time()
+                if now - self.last_heartbeat > interval_sec * 0.8:
+                    await self.ws.send_json({"op": 1, "d": self.sequence})
+                    self.last_heartbeat = now
+                await asyncio.sleep(interval_sec * random.uniform(0.8, 1.2))
+            except Exception as e:
+                if self.running:
+                    logger.debug(f"heartbeat: {e}")
+                break
 
     async def message_loop(self):
         async for msg in self.ws:
@@ -166,14 +175,22 @@ class DiscordGatewayClient:
 
     async def reconnect(self):
         self.running = False
+        if self.ws:
+            await self.ws.close()
+        if self._session:
+            await self._session.close()
+            self._session = None
         await asyncio.sleep(random.uniform(1, 3))
         await self.connect()
 
     async def handle_event(self, data):
         self.sequence = data.get('s')
         
-        if data.get('t') == 'READY':
+        if data.get('op') == 10:  # Hello — первое сообщение, содержит heartbeat_interval
             self.heartbeat_interval = data['d']['heartbeat_interval']
+        
+        elif data.get('t') == 'READY':
+            self.heartbeat_interval = data['d'].get('heartbeat_interval') or self.heartbeat_interval
             self.session_id = data['d']['session_id']
             logger.info(f"✅ Готов: {data['d']['user']['username']} (build {self.current_fp['client_build']})")
         
