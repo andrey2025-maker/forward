@@ -12,7 +12,7 @@ from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
-load_dotenv()
+load_dotenv()  # опционально, если есть .env
 
 logging.basicConfig(
     level=logging.INFO,
@@ -348,11 +348,16 @@ TG цель: {self.target_chat_id or "не установлена"}
 
 async def main():
     DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-    ADMIN_ID = os.getenv('ADMIN_ID')
+    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
+    ADMIN_ID = os.getenv('ADMIN_ID') or os.getenv('ADMIN_TG_ID')
 
-    if not all([DISCORD_TOKEN, TELEGRAM_TOKEN, ADMIN_ID]):
-        logger.error("❌ Заполни .env!")
+    missing = []
+    if not DISCORD_TOKEN: missing.append('DISCORD_TOKEN')
+    if not TELEGRAM_TOKEN: missing.append('TELEGRAM_TOKEN или TELEGRAM_BOT_TOKEN')
+    if not ADMIN_ID: missing.append('ADMIN_ID или ADMIN_TG_ID')
+
+    if missing:
+        logger.error(f"❌ Не заданы переменные окружения: {', '.join(missing)}")
         return
 
     tg_bot = TelegramBot(TELEGRAM_TOKEN, ADMIN_ID)
